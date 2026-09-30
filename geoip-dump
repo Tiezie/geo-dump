@@ -1,0 +1,1354 @@
+#!/usr/bin/env python3
+
+import argparse
+import ipaddress
+import os
+import re
+import signal
+import sys
+from datetime import datetime
+
+
+DEFAULT_FILE = "/usr/local/share/xray/geoip.dat"
+
+
+class ProtoError(Exception):
+    pass
+
+
+# ============================================================
+# Protobuf 基础解析
+# ============================================================
+
+def read_varint(buf, pos):
+    value = 0
+    shift = 0
+
+    while True:
+        if pos >= len(buf):
+            raise ProtoError(
+                "unexpected EOF while reading varint"
+            )
+
+        b = buf[pos]
+        pos += 1
+
+        value |= (b & 0x7f) << shift
+
+        if b < 0x80:
+            return value, pos
+
+        shift += 7
+
+        if shift >= 70:
+            raise ProtoError(
+                "invalid protobuf varint"
+            )
+
+
+def fields(buf):
+    pos = 0
+    length = len(buf)
+
+    while pos < length:
+
+        key, pos = read_varint(
+            buf,
+            pos
+        )
+
+        field_no = key >> 3
+        wire_type = key & 7
+
+        if field_no == 0:
+            raise ProtoError(
+                "invalid protobuf field number 0"
+            )
+
+        # varint
+        if wire_type == 0:
+
+            value, pos = read_varint(
+                buf,
+                pos
+            )
+
+            yield (
+                field_no,
+                wire_type,
+                value
+            )
+
+        # fixed64
+        elif wire_type == 1:
+
+            end = pos + 8
+
+            if end > length:
+                raise ProtoError(
+                    "unexpected EOF in fixed64"
+                )
+
+            yield (
+                field_no,
+                wire_type,
+                buf[pos:end]
+            )
+
+            pos = end
+
+        # length-delimited
+        elif wire_type == 2:
+
+            size, pos = read_varint(
+                buf,
+                pos
+            )
+
+            end = pos + size
+
+            if end > length:
+                raise ProtoError(
+                    "unexpected EOF in length-delimited field"
+                )
+
+            yield (
+                field_no,
+                wire_type,
+                buf[pos:end]
+            )
+
+            pos = end
+
+        # fixed32
+        elif wire_type == 5:
+
+            end = pos + 4
+
+            if end > length:
+                raise ProtoError(
+                    "unexpected EOF in fixed32"
+                )
+
+            yield (
+                field_no,
+                wire_type,
+                buf[pos:end]
+            )
+
+            pos = end
+
+        else:
+            raise ProtoError(
+                f"unsupported protobuf wire type: "
+                f"{wire_type}"
+            )
+
+
+def decode_text(value):
+    return bytes(value).decode(
+        "utf-8",
+        errors="replace"
+    )
+
+
+# ============================================================
+# GeoIP protobuf 解析
+#
+# message CIDR {
+#     bytes ip = 1;
+#     uint32 prefix = 2;
+# }
+#
+# message GeoIP {
+#     string code = 1;
+#     repeated CIDR cidr = 2;
+#     bool reverse_match = 3;
+# }
+#
+# message GeoIPList {
+#     repeated GeoIP entry = 1;
+# }
+# ============================================================
+
+def parse_cidr(raw):
+    ip_raw = None
+    prefix = 0
+
+    for field_no, wire_type, value in fields(raw):
+
+        # bytes ip = 1
+        if field_no == 1 and wire_type == 2:
+            ip_raw = bytes(value)
+
+        # uint32 prefix = 2
+        elif field_no == 2 and wire_type == 0:
+            prefix = value
+
+    if ip_raw is None:
+        raise ProtoError(
+            "CIDR has no IP value"
+        )
+
+    if len(ip_raw) == 4:
+        max_prefix = 32
+
+    elif len(ip_raw) == 16:
+        max_prefix = 128
+
+    else:
+        raise ProtoError(
+            f"invalid CIDR IP length: "
+            f"{len(ip_raw)} bytes"
+        )
+
+    if prefix > max_prefix:
+        raise ProtoError(
+            f"invalid prefix /{prefix}"
+        )
+
+    try:
+        address = ipaddress.ip_address(
+            ip_raw
+        )
+
+        network = ipaddress.ip_network(
+            f"{address}/{prefix}",
+            strict=False
+        )
+
+    except ValueError as e:
+        raise ProtoError(
+            f"invalid CIDR: {e}"
+        )
+
+    return network
+
+
+def parse_geoip(raw, load_cidrs=False):
+    code = ""
+    reverse_match = False
+    count = 0
+    cidrs = []
+
+    for field_no, wire_type, value in fields(raw):
+
+        # string code = 1
+        if field_no == 1 and wire_type == 2:
+            code = decode_text(value)
+
+        # repeated CIDR cidr = 2
+        elif field_no == 2 and wire_type == 2:
+
+            count += 1
+
+            if load_cidrs:
+                cidrs.append(
+                    parse_cidr(value)
+                )
+
+        # bool reverse_match = 3
+        elif field_no == 3 and wire_type == 0:
+
+            reverse_match = bool(value)
+
+    return (
+        code,
+        count,
+        reverse_match,
+        cidrs
+    )
+
+
+# ============================================================
+# 数据库
+# ============================================================
+
+class GeoIPDB:
+
+    def __init__(self, path):
+
+        self.path = os.path.abspath(
+            path
+        )
+
+        try:
+            with open(
+                self.path,
+                "rb"
+            ) as f:
+
+                self.data = memoryview(
+                    f.read()
+                )
+
+        except FileNotFoundError:
+
+            raise SystemExit(
+                f"错误: 找不到文件:\n"
+                f"{self.path}"
+            )
+
+        except PermissionError:
+
+            raise SystemExit(
+                f"错误: 没有权限读取:\n"
+                f"{self.path}"
+            )
+
+        except OSError as e:
+
+            raise SystemExit(
+                f"错误: 无法读取 "
+                f"{self.path}: {e}"
+            )
+
+
+    def raw_entries(self):
+
+        try:
+
+            # GeoIPList:
+            # repeated GeoIP entry = 1
+
+            for (
+                field_no,
+                wire_type,
+                value
+            ) in fields(self.data):
+
+                if (
+                    field_no == 1
+                    and wire_type == 2
+                ):
+                    yield value
+
+        except ProtoError as e:
+
+            raise SystemExit(
+                f"错误: 无法解析 "
+                f"{self.path}\n{e}"
+            )
+
+
+    def find(self, wanted, load_cidrs=True):
+
+        wanted = wanted.casefold()
+
+        for raw in self.raw_entries():
+
+            code, count, reverse, cidrs = (
+                parse_geoip(
+                    raw,
+                    load_cidrs=load_cidrs
+                )
+            )
+
+            if code.casefold() == wanted:
+
+                return (
+                    code,
+                    count,
+                    reverse,
+                    cidrs
+                )
+
+        return None
+
+
+# ============================================================
+# 工具函数
+# ============================================================
+
+def parse_ip(value):
+
+    try:
+        return ipaddress.ip_address(
+            value
+        )
+
+    except ValueError:
+        raise SystemExit(
+            f"错误: 无效 IP 地址: {value}"
+        )
+
+
+def raw_ip_match(ip, cidrs):
+
+    for network in cidrs:
+
+        if ip.version != network.version:
+            continue
+
+        if ip in network:
+            return True
+
+    return False
+
+
+def effective_ip_match(
+    ip,
+    cidrs,
+    reverse_match
+):
+
+    matched = raw_ip_match(
+        ip,
+        cidrs
+    )
+
+    if reverse_match:
+        return not matched
+
+    return matched
+
+
+def containing_networks(ip, cidrs):
+
+    result = []
+
+    for network in cidrs:
+
+        if ip.version != network.version:
+            continue
+
+        if ip in network:
+            result.append(
+                network
+            )
+
+    return result
+
+
+def make_matcher(
+    pattern,
+    regex=False,
+    exact=False
+):
+
+    if regex:
+
+        try:
+            compiled = re.compile(
+                pattern,
+                re.IGNORECASE
+            )
+
+        except re.error as e:
+
+            raise SystemExit(
+                f"错误: 正则表达式无效: {e}"
+            )
+
+        return lambda value: (
+            compiled.search(value)
+            is not None
+        )
+
+    folded = pattern.casefold()
+
+    if exact:
+
+        return lambda value: (
+            value.casefold()
+            == folded
+        )
+
+    return lambda value: (
+        folded in value.casefold()
+    )
+
+
+# ============================================================
+# info
+# ============================================================
+
+def cmd_info(args):
+
+    db = GeoIPDB(
+        args.file
+    )
+
+    category_count = 0
+    cidr_count = 0
+    reverse_count = 0
+
+    ipv4_count = 0
+    ipv6_count = 0
+
+    for raw in db.raw_entries():
+
+        (
+            code,
+            count,
+            reverse,
+            cidrs
+        ) = parse_geoip(
+            raw,
+            load_cidrs=True
+        )
+
+        if not code:
+            continue
+
+        category_count += 1
+        cidr_count += count
+
+        if reverse:
+            reverse_count += 1
+
+        for network in cidrs:
+
+            if network.version == 4:
+                ipv4_count += 1
+
+            else:
+                ipv6_count += 1
+
+    stat = os.stat(
+        db.path
+    )
+
+    print(
+        f"文件: {db.path}"
+    )
+
+    print(
+        f"大小: "
+        f"{stat.st_size:,} bytes "
+        f"("
+        f"{stat.st_size / 1024 / 1024:.2f} MiB"
+        f")"
+    )
+
+    print(
+        "修改时间: "
+        + datetime
+        .fromtimestamp(
+            stat.st_mtime
+        )
+        .astimezone()
+        .isoformat(
+            timespec="seconds"
+        )
+    )
+
+    print(
+        f"分类数: "
+        f"{category_count}"
+    )
+
+    print(
+        f"CIDR 总数: "
+        f"{cidr_count}"
+    )
+
+    print(
+        f"IPv4 CIDR: "
+        f"{ipv4_count}"
+    )
+
+    print(
+        f"IPv6 CIDR: "
+        f"{ipv6_count}"
+    )
+
+    print(
+        f"reverse_match 分类: "
+        f"{reverse_count}"
+    )
+
+
+# ============================================================
+# list
+# ============================================================
+
+def cmd_list(args):
+
+    db = GeoIPDB(
+        args.file
+    )
+
+    matcher = None
+
+    if args.filter:
+
+        matcher = make_matcher(
+            args.filter
+        )
+
+    rows = []
+
+    for raw in db.raw_entries():
+
+        (
+            code,
+            count,
+            reverse,
+            _
+        ) = parse_geoip(raw)
+
+        if not code:
+            continue
+
+        if (
+            matcher
+            and not matcher(code)
+        ):
+            continue
+
+        rows.append(
+            (
+                code.casefold(),
+                count,
+                reverse
+            )
+        )
+
+    if args.sort == "count":
+
+        rows.sort(
+            key=lambda x: (
+                -x[1],
+                x[0]
+            )
+        )
+
+    else:
+
+        rows.sort(
+            key=lambda x: x[0]
+        )
+
+    for (
+        code,
+        count,
+        reverse
+    ) in rows:
+
+        if args.quiet:
+
+            print(code)
+
+            continue
+
+        reverse_text = (
+            "\treverse"
+            if reverse
+            else ""
+        )
+
+        print(
+            f"{code}\t"
+            f"{count}"
+            f"{reverse_text}"
+        )
+
+
+# ============================================================
+# show
+# ============================================================
+
+def cmd_show(args):
+
+    db = GeoIPDB(
+        args.file
+    )
+
+    result = db.find(
+        args.category,
+        load_cidrs=True
+    )
+
+    if result is None:
+
+        raise SystemExit(
+            f"错误: 找不到 "
+            f"geoip:{args.category}"
+        )
+
+    (
+        code,
+        count,
+        reverse,
+        cidrs
+    ) = result
+
+    shown = 0
+
+    for network in cidrs:
+
+        if (
+            args.ipv4
+            and network.version != 4
+        ):
+            continue
+
+        if (
+            args.ipv6
+            and network.version != 6
+        ):
+            continue
+
+        print(network)
+        shown += 1
+
+    if not args.no_summary:
+
+        print(
+            f"# geoip:"
+            f"{code.casefold()} "
+            f"-> {shown} CIDRs",
+            file=sys.stderr
+        )
+
+        if reverse:
+
+            print(
+                "# reverse_match: true",
+                file=sys.stderr
+            )
+
+
+# ============================================================
+# search
+#
+# 搜索分类名称
+# ============================================================
+
+def cmd_search(args):
+
+    db = GeoIPDB(
+        args.file
+    )
+
+    matcher = make_matcher(
+        args.keyword,
+        regex=args.regex,
+        exact=args.exact
+    )
+
+    results = []
+
+    for raw in db.raw_entries():
+
+        (
+            code,
+            count,
+            reverse,
+            _
+        ) = parse_geoip(raw)
+
+        if not code:
+            continue
+
+        if matcher(code):
+
+            results.append(
+                (
+                    code.casefold(),
+                    count,
+                    reverse
+                )
+            )
+
+    results.sort()
+
+    for (
+        code,
+        count,
+        reverse
+    ) in results:
+
+        if args.quiet:
+
+            print(code)
+
+        else:
+
+            suffix = (
+                " [reverse]"
+                if reverse
+                else ""
+            )
+
+            print(
+                f"geoip:{code}"
+                f"\t{count} CIDRs"
+                f"{suffix}"
+            )
+
+    if not args.no_summary:
+
+        print(
+            f"# 匹配分类: "
+            f"{len(results)}",
+            file=sys.stderr
+        )
+
+    if not results:
+        raise SystemExit(1)
+
+
+# ============================================================
+# lookup
+#
+# 查询某个 IP 命中哪些 geoip 分类
+# ============================================================
+
+def cmd_lookup(args):
+
+    db = GeoIPDB(
+        args.file
+    )
+
+    ip = parse_ip(
+        args.ip
+    )
+
+    results = []
+
+    for raw in db.raw_entries():
+
+        (
+            code,
+            count,
+            reverse,
+            cidrs
+        ) = parse_geoip(
+            raw,
+            load_cidrs=True
+        )
+
+        if not code:
+            continue
+
+        raw_match = raw_ip_match(
+            ip,
+            cidrs
+        )
+
+        effective_match = (
+            not raw_match
+            if reverse
+            else raw_match
+        )
+
+        if not effective_match:
+            continue
+
+        networks = containing_networks(
+            ip,
+            cidrs
+        )
+
+        results.append(
+            (
+                code.casefold(),
+                reverse,
+                networks
+            )
+        )
+
+    results.sort(
+        key=lambda x: x[0]
+    )
+
+    for (
+        code,
+        reverse,
+        networks
+    ) in results:
+
+        if args.quiet:
+
+            print(code)
+            continue
+
+        print(
+            f"geoip:{code}",
+            end=""
+        )
+
+        if reverse:
+
+            print(
+                " [reverse_match]",
+                end=""
+            )
+
+        print()
+
+        if (
+            args.verbose
+            and networks
+        ):
+
+            for network in networks:
+
+                print(
+                    f"  -> {network}"
+                )
+
+        elif (
+            args.verbose
+            and reverse
+            and not networks
+        ):
+
+            print(
+                "  -> reverse_match: "
+                "IP 不在排除 CIDR 中"
+            )
+
+    if not args.no_summary:
+
+        print(
+            f"# {ip} 命中 "
+            f"{len(results)} 个分类",
+            file=sys.stderr
+        )
+
+    if not results:
+        raise SystemExit(1)
+
+
+# ============================================================
+# contains
+#
+# 判断指定 IP 是否属于某一个 geoip 分类
+# ============================================================
+
+def cmd_contains(args):
+
+    db = GeoIPDB(
+        args.file
+    )
+
+    ip = parse_ip(
+        args.ip
+    )
+
+    result = db.find(
+        args.category,
+        load_cidrs=True
+    )
+
+    if result is None:
+
+        raise SystemExit(
+            f"错误: 找不到 "
+            f"geoip:{args.category}"
+        )
+
+    (
+        code,
+        count,
+        reverse,
+        cidrs
+    ) = result
+
+    raw_match = raw_ip_match(
+        ip,
+        cidrs
+    )
+
+    effective_match = (
+        not raw_match
+        if reverse
+        else raw_match
+    )
+
+    networks = containing_networks(
+        ip,
+        cidrs
+    )
+
+    if effective_match:
+
+        print(
+            f"YES  {ip} "
+            f"属于 geoip:"
+            f"{code.casefold()}"
+        )
+
+        if reverse:
+
+            print(
+                "reverse_match: true"
+            )
+
+            print(
+                "原因: IP 不在该分类"
+                "保存的排除 CIDR 中"
+            )
+
+        elif networks:
+
+            print(
+                "命中 CIDR:"
+            )
+
+            for network in networks:
+
+                print(
+                    f"  {network}"
+                )
+
+        return
+
+    print(
+        f"NO   {ip} "
+        f"不属于 geoip:"
+        f"{code.casefold()}"
+    )
+
+    if reverse:
+
+        print(
+            "reverse_match: true"
+        )
+
+        if networks:
+
+            print(
+                "原因: IP 落在该分类"
+                "保存的排除 CIDR 中:"
+            )
+
+            for network in networks:
+
+                print(
+                    f"  {network}"
+                )
+
+    raise SystemExit(1)
+
+
+# ============================================================
+# argparse
+# ============================================================
+
+def build_parser():
+
+    examples = f"""
+默认读取：
+
+  {DEFAULT_FILE}
+
+常用命令：
+
+  geoip-dump info
+
+  geoip-dump list
+
+  geoip-dump list --sort count
+
+  geoip-dump list --filter cn
+
+  geoip-dump list -q
+
+  geoip-dump show cn
+
+  geoip-dump show private
+
+  geoip-dump show cn --ipv4
+
+  geoip-dump show cn --ipv6
+
+  geoip-dump search cn
+
+  geoip-dump lookup 8.8.8.8
+
+  geoip-dump lookup 8.8.8.8 -v
+
+  geoip-dump lookup 2001:4860:4860::8888
+
+  geoip-dump contains cn 223.5.5.5
+
+  geoip-dump contains us 8.8.8.8
+
+  geoip-dump contains private 192.168.1.1
+
+指定其他文件：
+
+  geoip-dump -f /path/geoip.dat info
+
+  geoip-dump -f /path/geoip.dat list
+
+  geoip-dump -f /path/geoip.dat lookup 8.8.8.8
+"""
+
+    parser = argparse.ArgumentParser(
+        prog="geoip-dump",
+        description=(
+            "查看和查询 Xray "
+            "geoip.dat "
+            "（纯 Python，无第三方依赖）"
+        ),
+        formatter_class=(
+            argparse.RawDescriptionHelpFormatter
+        ),
+        epilog=examples
+    )
+
+    parser.add_argument(
+        "-f",
+        "--file",
+        default=DEFAULT_FILE,
+        help=(
+            "geoip.dat 路径 "
+            f"(默认 {DEFAULT_FILE})"
+        )
+    )
+
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True
+    )
+
+    # --------------------------------------------------------
+    # info
+    # --------------------------------------------------------
+
+    p = sub.add_parser(
+        "info",
+        help="显示文件及统计信息"
+    )
+
+    p.set_defaults(
+        func=cmd_info
+    )
+
+
+    # --------------------------------------------------------
+    # list
+    # --------------------------------------------------------
+
+    p = sub.add_parser(
+        "list",
+        help="列出所有 geoip 分类"
+    )
+
+    p.add_argument(
+        "--filter",
+        help="按分类名称过滤"
+    )
+
+    p.add_argument(
+        "--sort",
+        choices=[
+            "name",
+            "count"
+        ],
+        default="name",
+        help="排序方式"
+    )
+
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="只显示分类名称"
+    )
+
+    p.set_defaults(
+        func=cmd_list
+    )
+
+
+    # --------------------------------------------------------
+    # show
+    # --------------------------------------------------------
+
+    p = sub.add_parser(
+        "show",
+        help="显示指定分类全部 CIDR"
+    )
+
+    p.add_argument(
+        "category",
+        help="例如 cn、us、private"
+    )
+
+    version_group = (
+        p.add_mutually_exclusive_group()
+    )
+
+    version_group.add_argument(
+        "--ipv4",
+        action="store_true",
+        help="只显示 IPv4"
+    )
+
+    version_group.add_argument(
+        "--ipv6",
+        action="store_true",
+        help="只显示 IPv6"
+    )
+
+    p.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="不显示统计"
+    )
+
+    p.set_defaults(
+        func=cmd_show
+    )
+
+
+    # --------------------------------------------------------
+    # search
+    # --------------------------------------------------------
+
+    p = sub.add_parser(
+        "search",
+        help="搜索 geoip 分类名称"
+    )
+
+    p.add_argument(
+        "keyword",
+        help="搜索关键词"
+    )
+
+    mode = (
+        p.add_mutually_exclusive_group()
+    )
+
+    mode.add_argument(
+        "-r",
+        "--regex",
+        action="store_true",
+        help="正则表达式"
+    )
+
+    mode.add_argument(
+        "-x",
+        "--exact",
+        action="store_true",
+        help="分类名精确匹配"
+    )
+
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="只显示分类名称"
+    )
+
+    p.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="不显示统计"
+    )
+
+    p.set_defaults(
+        func=cmd_search
+    )
+
+
+    # --------------------------------------------------------
+    # lookup
+    # --------------------------------------------------------
+
+    p = sub.add_parser(
+        "lookup",
+        help="查询 IP 属于哪些 geoip 分类"
+    )
+
+    p.add_argument(
+        "ip",
+        help="IPv4 或 IPv6 地址"
+    )
+
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="显示具体命中的 CIDR"
+    )
+
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="只显示分类名称"
+    )
+
+    p.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="不显示统计"
+    )
+
+    p.set_defaults(
+        func=cmd_lookup
+    )
+
+
+    # --------------------------------------------------------
+    # contains
+    # --------------------------------------------------------
+
+    p = sub.add_parser(
+        "contains",
+        help="判断 IP 是否属于指定分类"
+    )
+
+    p.add_argument(
+        "category",
+        help="例如 cn、us、private"
+    )
+
+    p.add_argument(
+        "ip",
+        help="IPv4 或 IPv6 地址"
+    )
+
+    p.set_defaults(
+        func=cmd_contains
+    )
+
+    return parser
+
+
+def main():
+
+    # 支持：
+    #
+    # geoip-dump show cn | less
+    # geoip-dump list | head
+    #
+    if hasattr(
+        signal,
+        "SIGPIPE"
+    ):
+
+        signal.signal(
+            signal.SIGPIPE,
+            signal.SIG_DFL
+        )
+
+    parser = build_parser()
+
+    args = parser.parse_args()
+
+    try:
+
+        args.func(args)
+
+    except ProtoError as e:
+
+        raise SystemExit(
+            f"错误: geoip.dat "
+            f"解析失败: {e}"
+        )
+
+    except KeyboardInterrupt:
+
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()

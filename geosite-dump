@@ -1,0 +1,1237 @@
+#!/usr/bin/env python3
+
+import argparse
+import os
+import re
+import signal
+import sys
+from datetime import datetime
+
+
+DEFAULT_FILE = "/usr/local/share/xray/geosite.dat"
+
+TYPE_NAME = {
+    0: "keyword",
+    1: "regexp",
+    2: "domain",
+    3: "full",
+}
+
+
+class ProtoError(Exception):
+    pass
+
+
+# ============================================================
+# Protobuf 基础解析
+# ============================================================
+
+def read_varint(buf, pos):
+    value = 0
+    shift = 0
+
+    while True:
+        if pos >= len(buf):
+            raise ProtoError("unexpected EOF while reading varint")
+
+        b = buf[pos]
+        pos += 1
+
+        value |= (b & 0x7f) << shift
+
+        if b < 0x80:
+            return value, pos
+
+        shift += 7
+
+        if shift >= 70:
+            raise ProtoError("invalid varint")
+
+
+def fields(buf):
+    pos = 0
+    length = len(buf)
+
+    while pos < length:
+        key, pos = read_varint(buf, pos)
+
+        field_no = key >> 3
+        wire_type = key & 7
+
+        if field_no == 0:
+            raise ProtoError("invalid protobuf field number 0")
+
+        # varint
+        if wire_type == 0:
+            value, pos = read_varint(buf, pos)
+            yield field_no, wire_type, value
+
+        # fixed64
+        elif wire_type == 1:
+            end = pos + 8
+
+            if end > length:
+                raise ProtoError("unexpected EOF in fixed64")
+
+            yield field_no, wire_type, buf[pos:end]
+            pos = end
+
+        # length-delimited
+        elif wire_type == 2:
+            size, pos = read_varint(buf, pos)
+            end = pos + size
+
+            if end > length:
+                raise ProtoError(
+                    "unexpected EOF in length-delimited field"
+                )
+
+            yield field_no, wire_type, buf[pos:end]
+            pos = end
+
+        # fixed32
+        elif wire_type == 5:
+            end = pos + 4
+
+            if end > length:
+                raise ProtoError("unexpected EOF in fixed32")
+
+            yield field_no, wire_type, buf[pos:end]
+            pos = end
+
+        else:
+            raise ProtoError(
+                f"unsupported protobuf wire type: {wire_type}"
+            )
+
+
+def decode_text(value):
+    return bytes(value).decode(
+        "utf-8",
+        errors="replace"
+    )
+
+
+def signed_int64(value):
+    if value >= (1 << 63):
+        return value - (1 << 64)
+
+    return value
+
+
+# ============================================================
+# geosite.dat 数据结构
+# ============================================================
+
+def parse_attribute(raw):
+    key = ""
+    kind = None
+    value = None
+
+    for field_no, wire_type, field_value in fields(raw):
+
+        # string key = 1
+        if field_no == 1 and wire_type == 2:
+            key = decode_text(field_value)
+
+        # bool bool_value = 2
+        elif field_no == 2 and wire_type == 0:
+            kind = "bool"
+            value = bool(field_value)
+
+        # int64 int_value = 3
+        elif field_no == 3 and wire_type == 0:
+            kind = "int"
+            value = signed_int64(field_value)
+
+    return key, kind, value
+
+
+def parse_domain(raw):
+    dtype = 0
+    value = ""
+    attrs = []
+
+    for field_no, wire_type, field_value in fields(raw):
+
+        # Type type = 1
+        if field_no == 1 and wire_type == 0:
+            dtype = field_value
+
+        # string value = 2
+        elif field_no == 2 and wire_type == 2:
+            value = decode_text(field_value)
+
+        # repeated Attribute attribute = 3
+        elif field_no == 3 and wire_type == 2:
+            attrs.append(
+                parse_attribute(field_value)
+            )
+
+    return dtype, value, attrs
+
+
+def parse_site(raw, load_domains=False):
+    code = ""
+    count = 0
+    domains = []
+
+    for field_no, wire_type, field_value in fields(raw):
+
+        # string code = 1
+        if field_no == 1 and wire_type == 2:
+            code = decode_text(field_value)
+
+        # repeated Domain domain = 2
+        elif field_no == 2 and wire_type == 2:
+            count += 1
+
+            if load_domains:
+                domains.append(
+                    parse_domain(field_value)
+                )
+
+    return code, count, domains
+
+
+# ============================================================
+# 数据库读取
+# ============================================================
+
+class GeoSiteDB:
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+
+        try:
+            with open(self.path, "rb") as f:
+                self.data = memoryview(f.read())
+
+        except FileNotFoundError:
+            raise SystemExit(
+                f"错误: 找不到文件:\n{self.path}"
+            )
+
+        except PermissionError:
+            raise SystemExit(
+                f"错误: 没有权限读取:\n{self.path}"
+            )
+
+        except OSError as e:
+            raise SystemExit(
+                f"错误: 无法读取 {self.path}: {e}"
+            )
+
+
+    def raw_sites(self):
+        try:
+            # GeoSiteList:
+            # repeated GeoSite entry = 1
+            for field_no, wire_type, field_value in fields(self.data):
+
+                if field_no == 1 and wire_type == 2:
+                    yield field_value
+
+        except ProtoError as e:
+            raise SystemExit(
+                f"错误: 无法解析 {self.path}\n{e}"
+            )
+
+
+# ============================================================
+# 输出格式
+# ============================================================
+
+def attribute_keys(attrs):
+    return {
+        key.casefold()
+        for key, _, _ in attrs
+        if key
+    }
+
+
+def format_attribute(attr):
+    key, kind, value = attr
+
+    if not key:
+        return ""
+
+    if kind == "bool":
+
+        if value:
+            return f"@{key}"
+
+        return f"@{key}=false"
+
+    if kind == "int":
+        return f"@{key}={value}"
+
+    return f"@{key}"
+
+
+def format_domain(domain):
+    dtype, value, attrs = domain
+
+    prefix = TYPE_NAME.get(
+        dtype,
+        f"type{dtype}"
+    )
+
+    attr_text = " ".join(
+        x
+        for x in (
+            format_attribute(a)
+            for a in attrs
+        )
+        if x
+    )
+
+    result = f"{prefix}:{value}"
+
+    if attr_text:
+        result += " " + attr_text
+
+    return result
+
+
+# ============================================================
+# 搜索匹配
+# ============================================================
+
+def make_matcher(
+    pattern,
+    regex=False,
+    exact=False,
+    word=False
+):
+
+    # 正则模式
+    if regex:
+        try:
+            compiled = re.compile(
+                pattern,
+                re.IGNORECASE
+            )
+
+        except re.error as e:
+            raise SystemExit(
+                f"错误: 正则表达式无效: {e}"
+            )
+
+        return lambda value: (
+            compiled.search(value) is not None
+        )
+
+    folded = pattern.casefold()
+
+    # 完整 value 精确匹配
+    if exact:
+        return lambda value: (
+            value.casefold() == folded
+        )
+
+    # 独立 token 匹配
+    #
+    # 搜 ai 时：
+    #
+    # ai.google      命中
+    # example.ai     命中
+    # test-ai.com    命中
+    #
+    # mail.google    不命中
+    # openai.com     不命中
+    #
+    if word:
+        compiled = re.compile(
+            rf"(?<![0-9A-Za-z])"
+            rf"{re.escape(pattern)}"
+            rf"(?![0-9A-Za-z])",
+            re.IGNORECASE
+        )
+
+        return lambda value: (
+            compiled.search(value) is not None
+        )
+
+    # 默认：普通包含搜索
+    return lambda value: (
+        folded in value.casefold()
+    )
+
+
+def matcher_from_args(pattern, args):
+    return make_matcher(
+        pattern,
+        regex=args.regex,
+        exact=args.exact,
+        word=args.word
+    )
+
+
+def domain_type_allowed(domain, type_filter):
+
+    if not type_filter:
+        return True
+
+    dtype = TYPE_NAME.get(
+        domain[0],
+        f"type{domain[0]}"
+    )
+
+    return dtype in type_filter
+
+
+# ============================================================
+# info
+# ============================================================
+
+def cmd_info(args):
+    db = GeoSiteDB(args.file)
+
+    category_count = 0
+    rule_count = 0
+
+    for raw in db.raw_sites():
+        code, count, _ = parse_site(raw)
+
+        if not code:
+            continue
+
+        category_count += 1
+        rule_count += count
+
+    stat = os.stat(db.path)
+
+    print(f"文件: {db.path}")
+
+    print(
+        f"大小: {stat.st_size:,} bytes "
+        f"({stat.st_size / 1024 / 1024:.2f} MiB)"
+    )
+
+    print(
+        "修改时间: "
+        + datetime
+        .fromtimestamp(stat.st_mtime)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
+
+    print(f"分类数: {category_count}")
+    print(f"规则数: {rule_count}")
+
+
+# ============================================================
+# list
+# ============================================================
+
+def cmd_list(args):
+    db = GeoSiteDB(args.file)
+
+    rows = []
+
+    name_match = None
+
+    if args.filter:
+        name_match = make_matcher(
+            args.filter
+        )
+
+    for raw in db.raw_sites():
+        code, count, _ = parse_site(raw)
+
+        if not code:
+            continue
+
+        if name_match and not name_match(code):
+            continue
+
+        rows.append(
+            (
+                code.casefold(),
+                count
+            )
+        )
+
+    if args.sort == "count":
+        rows.sort(
+            key=lambda x: (
+                -x[1],
+                x[0]
+            )
+        )
+
+    else:
+        rows.sort(
+            key=lambda x: x[0]
+        )
+
+    for code, count in rows:
+
+        if args.quiet:
+            print(code)
+
+        else:
+            print(
+                f"{code}\t{count}"
+            )
+
+
+# ============================================================
+# show
+# ============================================================
+
+def split_selector(selector):
+    parts = selector.split("@")
+
+    code = parts[0].strip()
+
+    attrs = [
+        x.strip()
+        for x in parts[1:]
+        if x.strip()
+    ]
+
+    if not code:
+        raise SystemExit(
+            "错误: geosite 分类不能为空"
+        )
+
+    return code, attrs
+
+
+def cmd_show(args):
+    db = GeoSiteDB(args.file)
+
+    wanted, required_attrs = split_selector(
+        args.selector
+    )
+
+    wanted = wanted.casefold()
+
+    required_attrs = {
+        x.casefold()
+        for x in required_attrs
+    }
+
+    for raw in db.raw_sites():
+
+        # 先只解析分类名
+        code, _, _ = parse_site(raw)
+
+        if code.casefold() != wanted:
+            continue
+
+        # 找到后才解析完整 domain
+        _, _, domains = parse_site(
+            raw,
+            load_domains=True
+        )
+
+        matched = 0
+
+        for domain in domains:
+
+            if required_attrs:
+
+                current_attrs = attribute_keys(
+                    domain[2]
+                )
+
+                if not required_attrs.issubset(
+                    current_attrs
+                ):
+                    continue
+
+            if not domain_type_allowed(
+                domain,
+                args.type
+            ):
+                continue
+
+            print(
+                format_domain(domain)
+            )
+
+            matched += 1
+
+        if not args.no_summary:
+            print(
+                f"# geosite:"
+                f"{args.selector.casefold()} "
+                f"-> {matched} rules",
+                file=sys.stderr
+            )
+
+        return
+
+    raise SystemExit(
+        f"错误: 找不到 geosite:{args.selector}"
+    )
+
+
+# ============================================================
+# names
+# ============================================================
+
+def cmd_names(args):
+    db = GeoSiteDB(args.file)
+
+    matcher = matcher_from_args(
+        args.keyword,
+        args
+    )
+
+    rows = []
+
+    for raw in db.raw_sites():
+        code, count, _ = parse_site(raw)
+
+        if code and matcher(code):
+            rows.append(
+                (
+                    code.casefold(),
+                    count
+                )
+            )
+
+    rows.sort()
+
+    for code, count in rows:
+
+        if args.quiet:
+            print(code)
+
+        else:
+            print(
+                f"{code}\t{count}"
+            )
+
+    if not rows:
+        raise SystemExit(1)
+
+
+# ============================================================
+# search
+#
+# 注意：
+# 这里只搜索 domain 的 value
+#
+# 不搜索：
+# domain:
+# full:
+# keyword:
+# regexp:
+#
+# 因此搜索 ai 不会因为 "domain" 里有 ai 而误报
+# ============================================================
+
+def cmd_search(args):
+    db = GeoSiteDB(args.file)
+
+    matcher = matcher_from_args(
+        args.keyword,
+        args
+    )
+
+    category_count = 0
+    rule_count = 0
+
+    for raw in db.raw_sites():
+
+        code, _, domains = parse_site(
+            raw,
+            load_domains=True
+        )
+
+        hits = []
+
+        for domain in domains:
+
+            if not domain_type_allowed(
+                domain,
+                args.type
+            ):
+                continue
+
+            # 关键修正：
+            # domain[1] 才是真正的 value
+            if matcher(domain[1]):
+                hits.append(domain)
+
+        if not hits:
+            continue
+
+        category_count += 1
+        rule_count += len(hits)
+
+        if args.quiet:
+            print(
+                code.casefold()
+            )
+            continue
+
+        print(
+            f"===== geosite:"
+            f"{code.casefold()} "
+            f"({len(hits)} hits) ====="
+        )
+
+        for domain in hits:
+            print(
+                format_domain(domain)
+            )
+
+        print()
+
+    if not args.no_summary:
+        print(
+            f"# 匹配分类: {category_count}, "
+            f"匹配规则: {rule_count}",
+            file=sys.stderr
+        )
+
+    if category_count == 0:
+        raise SystemExit(1)
+
+
+# ============================================================
+# common
+#
+# 找同一个分类里同时存在多个关键词
+#
+# 例如：
+#
+# geosite-dump common ai google
+#
+# ai 和 google 可以分别存在于不同规则中，
+# 只要求属于同一个 geosite 分类。
+# ============================================================
+
+def cmd_common(args):
+
+    if len(args.keywords) < 2:
+        raise SystemExit(
+            "错误: common 至少需要两个关键词"
+        )
+
+    db = GeoSiteDB(args.file)
+
+    matchers = [
+        matcher_from_args(
+            keyword,
+            args
+        )
+        for keyword in args.keywords
+    ]
+
+    category_count = 0
+
+    for raw in db.raw_sites():
+
+        code, _, domains = parse_site(
+            raw,
+            load_domains=True
+        )
+
+        candidates = [
+            domain
+            for domain in domains
+            if domain_type_allowed(
+                domain,
+                args.type
+            )
+        ]
+
+        groups = []
+
+        for matcher in matchers:
+
+            hits = [
+                domain
+                for domain in candidates
+                if matcher(domain[1])
+            ]
+
+            if not hits:
+                groups = []
+                break
+
+            groups.append(hits)
+
+        if not groups:
+            continue
+
+        category_count += 1
+
+        if args.quiet:
+            print(
+                code.casefold()
+            )
+            continue
+
+        print(
+            f"===== geosite:"
+            f"{code.casefold()} ====="
+        )
+
+        for keyword, hits in zip(
+            args.keywords,
+            groups
+        ):
+
+            print(
+                f"--- {keyword} "
+                f"({len(hits)}) ---"
+            )
+
+            for domain in hits:
+                print(
+                    format_domain(domain)
+                )
+
+        print()
+
+    if not args.no_summary:
+        print(
+            f"# 同时命中的分类: "
+            f"{category_count}",
+            file=sys.stderr
+        )
+
+    if category_count == 0:
+        raise SystemExit(1)
+
+
+# ============================================================
+# same
+#
+# 找同一条规则中同时存在多个关键词
+#
+# 例如：
+#
+# ai.google
+#
+# 可以同时命中 ai + google
+# ============================================================
+
+def cmd_same(args):
+
+    if len(args.keywords) < 2:
+        raise SystemExit(
+            "错误: same 至少需要两个关键词"
+        )
+
+    db = GeoSiteDB(args.file)
+
+    matchers = [
+        matcher_from_args(
+            keyword,
+            args
+        )
+        for keyword in args.keywords
+    ]
+
+    category_count = 0
+    rule_count = 0
+
+    for raw in db.raw_sites():
+
+        code, _, domains = parse_site(
+            raw,
+            load_domains=True
+        )
+
+        hits = []
+
+        for domain in domains:
+
+            if not domain_type_allowed(
+                domain,
+                args.type
+            ):
+                continue
+
+            value = domain[1]
+
+            if all(
+                matcher(value)
+                for matcher in matchers
+            ):
+                hits.append(domain)
+
+        if not hits:
+            continue
+
+        category_count += 1
+        rule_count += len(hits)
+
+        if args.quiet:
+            print(
+                code.casefold()
+            )
+            continue
+
+        print(
+            f"===== geosite:"
+            f"{code.casefold()} "
+            f"({len(hits)} hits) ====="
+        )
+
+        for domain in hits:
+            print(
+                format_domain(domain)
+            )
+
+        print()
+
+    if not args.no_summary:
+        print(
+            f"# 同一规则同时命中: "
+            f"{category_count} 个分类, "
+            f"{rule_count} 条规则",
+            file=sys.stderr
+        )
+
+    if category_count == 0:
+        raise SystemExit(1)
+
+
+# ============================================================
+# argparse 公共参数
+# ============================================================
+
+def add_match_options(parser):
+
+    mode = parser.add_mutually_exclusive_group()
+
+    mode.add_argument(
+        "-r",
+        "--regex",
+        action="store_true",
+        help="使用正则表达式搜索"
+    )
+
+    mode.add_argument(
+        "-x",
+        "--exact",
+        action="store_true",
+        help="精确匹配整个规则 value"
+    )
+
+    mode.add_argument(
+        "-w",
+        "--word",
+        action="store_true",
+        help=(
+            "按独立 token 匹配；"
+            "例如 ai 不匹配 mail/openai"
+        )
+    )
+
+    parser.add_argument(
+        "-t",
+        "--type",
+        action="append",
+        choices=[
+            "keyword",
+            "regexp",
+            "domain",
+            "full"
+        ],
+        help=(
+            "只搜索指定规则类型；"
+            "可重复使用"
+        )
+    )
+
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="只输出命中的 geosite 分类名"
+    )
+
+    parser.add_argument(
+        "--no-summary",
+        action="store_true",
+        help="不显示统计"
+    )
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+def build_parser():
+
+    examples = f"""
+默认读取：
+
+  {DEFAULT_FILE}
+
+常用命令：
+
+  geosite-dump info
+
+  geosite-dump list
+
+  geosite-dump list --filter google
+
+  geosite-dump show google
+
+  geosite-dump show 'google@cn'
+
+  geosite-dump search ai
+
+  geosite-dump search ai -w
+
+  geosite-dump search openai
+
+  geosite-dump names google
+
+  geosite-dump common ai google
+
+  geosite-dump common ai google -w
+
+  geosite-dump common ai google -q
+
+  geosite-dump same ai google
+
+  geosite-dump search '(^|[.-])ai([.-]|$)' -r
+
+其他 geosite.dat：
+
+  geosite-dump -f /path/geosite.dat info
+
+  geosite-dump -f /path/geosite.dat search openai
+"""
+
+    parser = argparse.ArgumentParser(
+        prog="geosite-dump",
+        description=(
+            "查看和搜索 Xray geosite.dat "
+            "（纯 Python，无第三方依赖）"
+        ),
+        formatter_class=(
+            argparse.RawDescriptionHelpFormatter
+        ),
+        epilog=examples
+    )
+
+    parser.add_argument(
+        "-f",
+        "--file",
+        default=DEFAULT_FILE,
+        help=(
+            "geosite.dat 路径 "
+            f"(默认 {DEFAULT_FILE})"
+        )
+    )
+
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True
+    )
+
+    # info
+    p = sub.add_parser(
+        "info",
+        help="确认实际读取的文件和统计信息"
+    )
+
+    p.set_defaults(
+        func=cmd_info
+    )
+
+    # list
+    p = sub.add_parser(
+        "list",
+        help="列出全部分类"
+    )
+
+    p.add_argument(
+        "--filter",
+        help="按分类名包含关键词过滤"
+    )
+
+    p.add_argument(
+        "--sort",
+        choices=[
+            "name",
+            "count"
+        ],
+        default="name",
+        help="排序方式"
+    )
+
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true",
+        help="只显示分类名称"
+    )
+
+    p.set_defaults(
+        func=cmd_list
+    )
+
+    # show
+    p = sub.add_parser(
+        "show",
+        help="显示一个分类的规则"
+    )
+
+    p.add_argument(
+        "selector",
+        help=(
+            "例如 google、"
+            "google@cn"
+        )
+    )
+
+    p.add_argument(
+        "-t",
+        "--type",
+        action="append",
+        choices=[
+            "keyword",
+            "regexp",
+            "domain",
+            "full"
+        ],
+        help="只显示指定类型"
+    )
+
+    p.add_argument(
+        "--no-summary",
+        action="store_true"
+    )
+
+    p.set_defaults(
+        func=cmd_show
+    )
+
+    # names
+    p = sub.add_parser(
+        "names",
+        help="只搜索 geosite 分类名称"
+    )
+
+    p.add_argument(
+        "keyword"
+    )
+
+    mode = p.add_mutually_exclusive_group()
+
+    mode.add_argument(
+        "-r",
+        "--regex",
+        action="store_true"
+    )
+
+    mode.add_argument(
+        "-x",
+        "--exact",
+        action="store_true"
+    )
+
+    mode.add_argument(
+        "-w",
+        "--word",
+        action="store_true"
+    )
+
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action="store_true"
+    )
+
+    p.set_defaults(
+        func=cmd_names
+    )
+
+    # search
+    p = sub.add_parser(
+        "search",
+        help="搜索所有分类中的真实规则 value"
+    )
+
+    p.add_argument(
+        "keyword"
+    )
+
+    add_match_options(p)
+
+    p.set_defaults(
+        func=cmd_search
+    )
+
+    # common
+    p = sub.add_parser(
+        "common",
+        help=(
+            "查找同时包含多个关键词的分类"
+        )
+    )
+
+    p.add_argument(
+        "keywords",
+        nargs="+"
+    )
+
+    add_match_options(p)
+
+    p.set_defaults(
+        func=cmd_common
+    )
+
+    # same
+    p = sub.add_parser(
+        "same",
+        help=(
+            "查找同一条规则同时包含多个关键词"
+        )
+    )
+
+    p.add_argument(
+        "keywords",
+        nargs="+"
+    )
+
+    add_match_options(p)
+
+    p.set_defaults(
+        func=cmd_same
+    )
+
+    return parser
+
+
+def main():
+
+    # 支持：
+    #
+    # geosite-dump search ai | head
+    # geosite-dump show google | less
+    #
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(
+            signal.SIGPIPE,
+            signal.SIG_DFL
+        )
+
+    parser = build_parser()
+
+    args = parser.parse_args()
+
+    try:
+        args.func(args)
+
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    main()
